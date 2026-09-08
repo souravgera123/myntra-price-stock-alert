@@ -1,7 +1,6 @@
 import os
 import re
 import time
-import json
 import logging
 from typing import Optional
 
@@ -9,9 +8,9 @@ import requests
 from bs4 import BeautifulSoup
 
 
-# =========================
+# =========================================================
 # CONFIG
-# =========================
+# =========================================================
 
 PRODUCT_URL = os.getenv(
     "PRODUCT_URL",
@@ -24,25 +23,36 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "90"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-REQUEST_TIMEOUT = 25
+REQUEST_TIMEOUT = 30
+
+
+# =========================================================
+# LOGGING
+# =========================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
+
+# =========================================================
+# SESSION
+# =========================================================
+
 session = requests.Session()
 
 session.headers.update({
     "User-Agent": (
         "Mozilla/5.0 (Linux; Android 15) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "AppleWebKit/537.36 "
+        "(KHTML, like Gecko) "
         "Chrome/140.0.0.0 Mobile Safari/537.36"
     ),
     "Accept": (
         "text/html,application/xhtml+xml,"
-        "application/xml;q=0.9,image/avif,image/webp,"
-        "*/*;q=0.8"
+        "application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
     ),
     "Accept-Language": "en-IN,en;q=0.9",
     "Cache-Control": "no-cache",
@@ -51,348 +61,511 @@ session.headers.update({
 })
 
 
-# =========================
+# =========================================================
 # TELEGRAM
-# =========================
+# =========================================================
 
-def telegram_send(message: str) -> bool:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.error("Telegram credentials missing.")
+def send_telegram(message: str) -> bool:
+
+    if not TELEGRAM_BOT_TOKEN:
+        logging.error("TELEGRAM_BOT_TOKEN missing")
+        return False
+
+    if not TELEGRAM_CHAT_ID:
+        logging.error("TELEGRAM_CHAT_ID missing")
         return False
 
     url = (
-        f"https://api.telegram.org/bot"
-        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     )
 
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "disable_web_page_preview": False,
-    }
-
     try:
+
         response = session.post(
             url,
-            json=payload,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "disable_web_page_preview": False,
+            },
             timeout=REQUEST_TIMEOUT
         )
 
         if response.ok:
+            logging.info("Telegram message sent")
             return True
 
         logging.error(
-            "Telegram error: %s %s",
+            "Telegram error %s: %s",
             response.status_code,
             response.text[:300]
         )
 
     except requests.RequestException as exc:
-        logging.error("Telegram request failed: %s", exc)
+
+        logging.error(
+            "Telegram request error: %s",
+            exc
+        )
 
     return False
 
 
-# =========================
-# PRICE PARSING
-# =========================
+# =========================================================
+# DIRECT MYNTRA REQUEST
+# =========================================================
 
-def clean_price(value) -> Optional[int]:
-    if value is None:
-        return None
-
-    if isinstance(value, (int, float)):
-        return int(value)
-
-    text = str(value)
-
-    numbers = re.findall(r"\d[\d,]*", text)
-
-    if not numbers:
-        return None
+def fetch_direct():
 
     try:
-        return int(numbers[0].replace(",", ""))
-    except ValueError:
+
+        response = session.get(
+            PRODUCT_URL,
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=True
+        )
+
+        logging.info(
+            "Direct Myntra HTTP: %s | bytes=%s",
+            response.status_code,
+            len(response.content)
+        )
+
+        if response.status_code == 200 and len(response.text) > 10000:
+            return response.text
+
+        logging.warning(
+            "Direct Myntra response unusable"
+        )
+
+    except requests.RequestException as exc:
+
+        logging.warning(
+            "Direct Myntra request failed: %s",
+            exc
+        )
+
+    return None
+
+
+# =========================================================
+# FALLBACK READER
+#
+# If Myntra gives Render a tiny/challenge response,
+# use a text-rendering fallback.
+# =========================================================
+
+def fetch_fallback():
+
+    # Reader-style URL.
+    reader_url = (
+        "https://r.jina.ai/"
+        + PRODUCT_URL
+    )
+
+    try:
+
+        response = requests.get(
+            reader_url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 "
+                    "Chrome/140 Safari/537.36"
+                ),
+                "Accept": "text/plain,text/html,*/*",
+            },
+            timeout=REQUEST_TIMEOUT
+        )
+
+        logging.info(
+            "Fallback HTTP: %s | bytes=%s",
+            response.status_code,
+            len(response.content)
+        )
+
+        if response.status_code == 200:
+
+            text = response.text.strip()
+
+            if len(text) > 500:
+                return text
+
+    except requests.RequestException as exc:
+
+        logging.warning(
+            "Fallback request failed: %s",
+            exc
+        )
+
+    return None
+
+
+# =========================================================
+# PRICE EXTRACTION
+# =========================================================
+
+def extract_price(text: str) -> Optional[int]:
+
+    if not text:
         return None
 
+    candidates = []
 
-def extract_prices(html: str):
-    prices = []
+    # ---------------------------------------------
+    # JSON / HTML style price fields
+    # ---------------------------------------------
 
-    # JSON-LD
-    soup = BeautifulSoup(html, "html.parser")
-
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(script.string or script.get_text())
-
-            objects = data if isinstance(data, list) else [data]
-
-            for obj in objects:
-                if not isinstance(obj, dict):
-                    continue
-
-                offers = obj.get("offers")
-
-                if isinstance(offers, dict):
-                    p = clean_price(offers.get("price"))
-                    if p:
-                        prices.append(p)
-
-                elif isinstance(offers, list):
-                    for offer in offers:
-                        if isinstance(offer, dict):
-                            p = clean_price(offer.get("price"))
-                            if p:
-                                prices.append(p)
-
-        except Exception:
-            pass
-
-    # Common Myntra price patterns
     patterns = [
-        r'"discountedPrice"\s*:\s*(\d+)',
-        r'"discountedPrice"\s*:\s*"(\d+)"',
-        r'"sellingPrice"\s*:\s*(\d+)',
-        r'"sellingPrice"\s*:\s*"(\d+)"',
-        r'"discounted_price"\s*:\s*(\d+)',
-        r'"price"\s*:\s*(\d+)',
-        r'"price"\s*:\s*"(\d+)"',
+
+        r'"discountedPrice"\s*:\s*"?(\\?d+)"?',
+        r'"discounted_price"\s*:\s*"?(\\?d+)"?',
+        r'"sellingPrice"\s*:\s*"?(\\?d+)"?',
+        r'"selling_price"\s*:\s*"?(\\?d+)"?',
+        r'"currentPrice"\s*:\s*"?(\\?d+)"?',
+        r'"price"\s*:\s*"?(\\?d+)"?',
+
+    ]
+
+    # Correct numeric patterns separately
+    patterns = [
+        r'"discountedPrice"\s*:\s*"?(\d+)"?',
+        r'"discounted_price"\s*:\s*"?(\d+)"?',
+        r'"sellingPrice"\s*:\s*"?(\d+)"?',
+        r'"selling_price"\s*:\s*"?(\d+)"?',
+        r'"currentPrice"\s*:\s*"?(\d+)"?',
     ]
 
     for pattern in patterns:
-        for match in re.findall(pattern, html, flags=re.I):
+
+        for match in re.findall(
+            pattern,
+            text,
+            flags=re.I
+        ):
+
             try:
-                prices.append(int(match))
+                value = int(match)
+
+                if 100 <= value <= 100000:
+                    candidates.append(value)
+
             except ValueError:
                 pass
 
-    # Visible rupee prices
-    for match in re.findall(
-        r"(?:₹|Rs\.?\s*)\s*([\d,]+)",
-        html,
-        flags=re.I
-    ):
-        try:
-            prices.append(int(match.replace(",", "")))
-        except ValueError:
-            pass
 
-    # Remove obviously impossible values
-    prices = [
-        p for p in prices
-        if 1 <= p <= 10_00_000
+    # ---------------------------------------------
+    # Myntra visible text
+    # ---------------------------------------------
+
+    visible_patterns = [
+
+        r"Selling Price\s*(?:Rs\.?|₹)\s*([\d,]+)",
+
+        r"Price Details.*?(?:Rs\.?|₹)\s*([\d,]+)",
+
+        r"(?:Rs\.?|₹)\s*([\d,]+)",
+
     ]
 
-    if not prices:
+    for pattern in visible_patterns:
+
+        for match in re.findall(
+            pattern,
+            text,
+            flags=re.I | re.S
+        ):
+
+            try:
+
+                value = int(
+                    match.replace(",", "")
+                )
+
+                if 100 <= value <= 100000:
+                    candidates.append(value)
+
+            except ValueError:
+                pass
+
+
+    if not candidates:
         return None
 
-    # Prefer a price near the actual product price.
-    # For this product, ₹8,999 is expected currently.
-    # Taking the smallest candidate can accidentally pick coupon/offer values,
-    # so use frequency first.
-    frequency = {}
 
-    for p in prices:
-        frequency[p] = frequency.get(p, 0) + 1
+    # -------------------------------------------------
+    # Important:
+    # Prefer the price near "Selling Price".
+    # -------------------------------------------------
 
-    most_common = sorted(
-        frequency.items(),
-        key=lambda x: (-x[1], x[0])
+    lower = text.lower()
+
+    selling_index = lower.find(
+        "selling price"
     )
 
-    return most_common[0][0]
+    if selling_index >= 0:
+
+        nearby = text[
+            selling_index:
+            selling_index + 200
+        ]
+
+        nearby_prices = re.findall(
+            r"(?:₹|Rs\.?)\s*([\d,]+)",
+            nearby,
+            flags=re.I
+        )
+
+        for value in nearby_prices:
+
+            try:
+
+                value = int(
+                    value.replace(",", "")
+                )
+
+                if 100 <= value <= 100000:
+                    return value
+
+            except ValueError:
+                pass
 
 
-# =========================
-# STOCK PARSING
-# =========================
+    # Frequency fallback
 
-def extract_stock(html: str):
-    soup = BeautifulSoup(html, "html.parser")
+    frequency = {}
 
-    html_lower = html.lower()
+    for value in candidates:
+        frequency[value] = (
+            frequency.get(value, 0) + 1
+        )
 
-    # Strong out-of-stock indicators
-    out_patterns = [
+    return sorted(
+        frequency,
+        key=lambda x: (
+            -frequency[x],
+            x
+        )
+    )[0]
+
+
+# =========================================================
+# STOCK EXTRACTION
+# =========================================================
+
+def extract_stock(text: str):
+
+    if not text:
+        return None, []
+
+
+    lower = text.lower()
+
+
+    # -------------------------------------------------
+    # Explicit out-of-stock
+    # -------------------------------------------------
+
+    out_words = [
         "out of stock",
         "sold out",
         "currently unavailable",
-        "notify me",
     ]
 
-    # Strong available indicators
-    available_patterns = [
+    for word in out_words:
+
+        if word in lower:
+
+            return False, []
+
+
+    # -------------------------------------------------
+    # Explicit available signals
+    # -------------------------------------------------
+
+    available_words = [
         "add to bag",
         "add to cart",
         "buy now",
     ]
 
-    out_found = any(
-        pattern in html_lower
-        for pattern in out_patterns
+    available = any(
+        word in lower
+        for word in available_words
     )
 
-    available_found = any(
-        pattern in html_lower
-        for pattern in available_patterns
-    )
 
-    # Extract visible size names.
+    # -------------------------------------------------
+    # Sizes
+    # -------------------------------------------------
+
     sizes = []
 
-    for text in soup.stripped_strings:
-        clean = text.strip()
+    size_patterns = [
+        r"\bOnesize\b",
+        r"\bOne Size\b",
+        r"\bFree Size\b",
+    ]
 
-        if not clean:
-            continue
+    for pattern in size_patterns:
 
-        if len(clean) > 30:
-            continue
+        matches = re.findall(
+            pattern,
+            text,
+            flags=re.I
+        )
 
-        if clean.lower() in {
-            "select size",
-            "size",
-            "add to bag",
-            "wishlist",
-            "buy now",
-        }:
-            continue
+        for match in matches:
 
-        # Common single-size watch listing
-        if clean.lower() in {
-            "onesize",
-            "one size",
-            "free size",
-        }:
-            sizes.append(clean)
+            if match not in sizes:
+                sizes.append(match)
 
-    sizes = list(dict.fromkeys(sizes))
 
-    if available_found and not out_found:
+    # -------------------------------------------------
+    # Final stock result
+    # -------------------------------------------------
+
+    if available:
+
         return True, sizes
 
-    if out_found and not available_found:
-        return False, sizes
-
-    # Product page accessible but stock state uncertain.
     return None, sizes
 
 
-# =========================
-# PRODUCT CHECK
-# =========================
+# =========================================================
+# CHECK PRODUCT
+# =========================================================
 
 def check_product():
-    try:
-        response = session.get(
-            PRODUCT_URL,
-            timeout=REQUEST_TIMEOUT
-        )
+
+    # -------------------------------------------------
+    # 1. Direct request
+    # -------------------------------------------------
+
+    text = fetch_direct()
+
+
+    # -------------------------------------------------
+    # 2. Fallback if direct response is bad
+    # -------------------------------------------------
+
+    if text is None:
 
         logging.info(
-            "Myntra HTTP status: %s",
-            response.status_code
+            "Using fallback reader..."
         )
 
-        if response.status_code != 200:
-            return None
+        text = fetch_fallback()
 
-        html = response.text
 
-        if len(html) < 10_000:
-            logging.warning(
-                "Myntra response is unusually small."
-            )
+    if not text:
 
-        price = extract_prices(html)
-        in_stock, sizes = extract_stock(html)
-
-        return {
-            "price": price,
-            "in_stock": in_stock,
-            "sizes": sizes,
-        }
-
-    except requests.RequestException as exc:
-        logging.error("Myntra request failed: %s", exc)
-        return None
-
-    except Exception as exc:
-        logging.exception(
-            "Unexpected parsing error: %s",
-            exc
+        logging.error(
+            "No usable Myntra response"
         )
+
         return None
 
 
-# =========================
+    price = extract_price(text)
+
+    stock, sizes = extract_stock(text)
+
+
+    logging.info(
+        "Parsed -> Price=%s | Stock=%s | Sizes=%s",
+        price,
+        stock,
+        sizes
+    )
+
+
+    return {
+        "price": price,
+        "stock": stock,
+        "sizes": sizes,
+    }
+
+
+# =========================================================
 # ALERT STATE
-# =========================
-
-last_price = None
-last_stock = None
+# =========================================================
 
 price_alert_sent = False
 stock_alert_sent = False
 
 
-def process_product(data):
-    global last_price
-    global last_stock
+# =========================================================
+# PROCESS ALERT
+# =========================================================
+
+def process(data):
+
     global price_alert_sent
     global stock_alert_sent
 
+
     if not data:
-        logging.warning(
-            "No usable product data. Will retry."
-        )
+
         return
 
-    price = data.get("price")
-    in_stock = data.get("in_stock")
-    sizes = data.get("sizes") or []
 
-    logging.info(
-        "Price=%s | Stock=%s | Sizes=%s",
-        price,
-        in_stock,
-        sizes
-    )
+    price = data["price"]
+    stock = data["stock"]
+    sizes = data["sizes"]
 
-    # ---------------------------------
+
+    # =====================================================
     # PRICE ALERT
-    # ---------------------------------
+    # =====================================================
 
     if price is not None:
 
-        # Reset after price goes above target.
+        logging.info(
+            "Current price: ₹%s | Target: ₹%s",
+            price,
+            TARGET_PRICE
+        )
+
+
+        # Price went above target again
+        # => allow future alert
         if price > TARGET_PRICE:
+
             price_alert_sent = False
 
-        if price <= TARGET_PRICE and not price_alert_sent:
+
+        # Target reached
+        if (
+            price <= TARGET_PRICE
+            and not price_alert_sent
+        ):
 
             message = (
                 "🔥 MYNTRA PRICE ALERT\n\n"
-                "boAt Lunar Discovery Pro Smartwatch\n"
+                "⌚ boAt Lunar Discovery Pro\n"
                 f"💰 Current Price: ₹{price:,}\n"
                 f"🎯 Target Price: ₹{TARGET_PRICE:,}\n"
+                "\n"
+                f"🔗 {PRODUCT_URL}"
             )
 
-            if telegram_send(
-                message + f"\n🔗 {PRODUCT_URL}"
-            ):
+
+            if send_telegram(message):
+
                 price_alert_sent = True
+
                 logging.info(
-                    "Price alert sent."
+                    "PRICE ALERT SENT"
                 )
 
-    # ---------------------------------
-    # STOCK ALERT
-    # ---------------------------------
 
-    if in_stock is True:
+    # =====================================================
+    # STOCK ALERT
+    # =====================================================
+
+    if stock is True:
 
         if not stock_alert_sent:
 
@@ -402,74 +575,120 @@ def process_product(data):
                 else "Available"
             )
 
-            message = (
-                "🟢 MYNTRA STOCK ALERT\n\n"
-                "boAt Lunar Discovery Pro Smartwatch\n"
-                f"📦 Stock: AVAILABLE\n"
-                f"👕 Size: {size_text}\n"
+
+            price_text = (
+                f"₹{price:,}"
+                if price is not None
+                else "Unknown"
             )
 
-            if price is not None:
-                message += f"💰 Price: ₹{price:,}\n"
 
-            message += f"\n🔗 {PRODUCT_URL}"
+            message = (
+                "🟢 MYNTRA STOCK ALERT\n\n"
+                "⌚ boAt Lunar Discovery Pro\n"
+                "📦 Stock: AVAILABLE\n"
+                f"👕 Size: {size_text}\n"
+                f"💰 Price: {price_text}\n"
+                "\n"
+                f"🔗 {PRODUCT_URL}"
+            )
 
-            if telegram_send(message):
+
+            if send_telegram(message):
+
                 stock_alert_sent = True
+
                 logging.info(
-                    "Stock alert sent."
+                    "STOCK ALERT SENT"
                 )
 
-    elif in_stock is False:
 
-        # Product went out of stock.
-        # Allow a future stock alert.
+    elif stock is False:
+
+        # Product became unavailable.
+        # Future availability should alert again.
         stock_alert_sent = False
 
-    last_price = price
-    last_stock = in_stock
 
-
-# =========================
+# =========================================================
 # MAIN LOOP
-# =========================
+# =========================================================
 
 def main():
 
-    logging.info("===================================")
-    logging.info("Myntra Price + Stock Alert Started")
-    logging.info("Product ID: 44438582")
-    logging.info("Target Price: ₹%s", TARGET_PRICE)
-    logging.info("Interval: %s seconds", CHECK_INTERVAL)
-    logging.info("===================================")
-
-    # Optional startup Telegram message
-    telegram_send(
-        "✅ Myntra Alert Bot Started\n\n"
-        "📦 Product: boAt Lunar Discovery Pro\n"
-        f"🎯 Target Price: ₹{TARGET_PRICE:,}\n"
-        f"⏱️ Check Interval: {CHECK_INTERVAL} seconds"
+    logging.info(
+        "===================================="
     )
+
+    logging.info(
+        "Myntra Price + Stock Alert Started"
+    )
+
+    logging.info(
+        "Product ID: 44438582"
+    )
+
+    logging.info(
+        "Target Price: ₹%s",
+        TARGET_PRICE
+    )
+
+    logging.info(
+        "Check Interval: %s seconds",
+        CHECK_INTERVAL
+    )
+
+    logging.info(
+        "===================================="
+    )
+
+
+    # -------------------------------------------------
+    # Startup Telegram message
+    # -------------------------------------------------
+
+    send_telegram(
+        "✅ Myntra Alert Bot Started\n\n"
+        "⌚ boAt Lunar Discovery Pro\n"
+        f"🎯 Target: ₹{TARGET_PRICE:,}\n"
+        f"⏱️ Checking every {CHECK_INTERVAL} seconds"
+    )
+
+
+    # -------------------------------------------------
+    # Continuous checking
+    # -------------------------------------------------
 
     while True:
 
         try:
+
             data = check_product()
-            process_product(data)
+
+            process(data)
 
         except Exception as exc:
+
             logging.exception(
-                "Main loop error: %s",
+                "Unexpected loop error: %s",
                 exc
             )
+
 
         logging.info(
             "Next check in %s seconds...",
             CHECK_INTERVAL
         )
 
-        time.sleep(CHECK_INTERVAL)
 
+        time.sleep(
+            CHECK_INTERVAL
+        )
+
+
+# =========================================================
+# START
+# =========================================================
 
 if __name__ == "__main__":
     main()
